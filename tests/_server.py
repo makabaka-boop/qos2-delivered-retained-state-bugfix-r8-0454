@@ -10,11 +10,12 @@ import time
 
 
 class ServerProcess:
-    def __init__(self, db_path: str, crash: str = "", port: int = 0):
+    def __init__(self, db_path: str, crash: str = "", port: int = 0, retained: bool = False):
         self.db_path = db_path
         self.port = port
         self.proc: subprocess.Popen | None = None
         self.crash = crash
+        self.retained = retained
 
     def start(self, timeout: float = 10.0) -> int:
         env = os.environ.copy()
@@ -33,6 +34,8 @@ class ServerProcess:
             "--port",
             str(self.port),
         ]
+        if self.retained:
+            args.append("--retained")
         self.proc = subprocess.Popen(
             args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )

@@ -45,12 +45,14 @@ python3 -m mqtt_inbox.query --db inbox.db --json          # JSON
 ## 数据模型（SQLite，WAL + synchronous=FULL）
 
 - `sessions(client_id PK, clean, epoch, connected)`：协议会话。
-- `qos2_flows(client_id, packet_id, state, topic, payload, updated_at)`：
-  QoS 2 交换状态，主键 `(client_id, packet_id)`。
+- `qos2_flows(client_id, packet_id, state, topic, payload, retain, updated_at)`：
+  QoS 2 交换状态，主键 `(client_id, packet_id)`，`retain` 是首次受理内容的一部分。
   - `pending`：PUBLISH 已在 **PUBREC 之前**持久化，等待 PUBREL；
   - `done`：交换完成的**墓碑**，用于重复 PUBREL / DUP=1 重传去重。
 - `inbox(id, client_id, topic, payload, packet_id, delivered_at)`：业务收件账，
   只增不删（CleanSession 不影响它）。
+- `retained(topic PK, payload, inbox_id)`（仅 `--retained`）：按 topic 的保留账，
+  只在 PUBREL 交付事务内变动；生命周期独立于协议会话。
 
 ## Exactly-once 与崩溃安全
 
@@ -111,6 +113,8 @@ mqtt_inbox/
   storage.py   # SQLite 会话/交换状态/收件账，事务边界与 epoch 守卫
   server.py    # TCP 入口、每连接线程、会话注册表、主分发循环
   query.py     # 只读收件查询 CLI（mode=ro）
+  retained.py  # 可选保留账（交付事务钩子）+ 主题过滤器（+/#/$ 边界）
+  retained_query.py  # 只读保留状态查询 CLI
 tests/
   _peer.py     # 手工 MQTT 对端（任意拆包/粘连/非法字节）
   _server.py   # 子进程服务器管理（含崩溃注入重启）
@@ -118,4 +122,31 @@ tests/
 ```
 
 
---retained 开启本地保留状态功能（仍无订阅和转发）。仅已完成 QoS2 交付的 RETAIN 消息更新按 topic 的保留账；零长度载荷删除该 topic，普通消息不更新保留账。重复 PUBLISH 必须保留首次受理的 topic、载荷及 RETAIN；重复 PUBREL 不重复交付或改变保留值。业务账、保留账、交换完成状态必须持久一致。保留账与 ClientId 协议会话生命周期分离。python -m mqtt_inbox.retained_query --db PATH --filter FILTER 只读查询，+ 匹配单层、# 匹配末尾零层或多层，开头通配符不匹配 $ 系统主题；空层是有效层。
+## 本地保留状态（`--retained`，可选）
+
+`--retained` 开启本地保留状态功能（仍无订阅和转发）。语义：
+
+- 保留账**只由成功交付驱动**：PUBLISH 到达 / PUBREC 发出（pending）时不触碰
+  保留账，因此消息还在等待 PUBREL/PUBCOMP 时，查询不会提前显示新值或删除旧值；
+- RETAIN 标志随**首次受理**的 PUBLISH（topic、载荷、RETAIN）一起在 PUBREC 前
+  持久化；重复 PUBLISH（pending 重传或 done 后 DUP=1 重发）即使携带不同主题、
+  载荷或保留标志也一律忽略，仍只重发 PUBREC；
+- PUBREL 时保留账与业务账、`qos2_flows.state='done'` 在**同一个 SQLite 事务**
+  提交，三账在持久边界（崩溃/接管/重启）上一致；重复 PUBREL 只回 PUBCOMP，
+  不重复交付也不改变保留值；
+- 零长度载荷的 RETAIN 消息在成功交付时**删除**该 topic 的保留值（删除本身仍入
+  业务账）；RETAIN=0 的普通消息不更新保留账；
+- 交换完成后同一 Packet Identifier 被新消息（DUP=0）复用时，新内容与新标志
+  正常生效；
+- 保留账与 ClientId 协议会话生命周期分离：同名接管、CleanSession=1 清理协议
+  会话与交换状态、进程重启/SIGKILL 都不影响已有保留账（业务账同理）；
+- `retained.inbox_id` 指向产生当前保留值的那条 `inbox` 记录。
+
+```bash
+python -m mqtt_inbox.retained_query --db PATH --filter FILTER
+```
+
+只读查询（`mode=ro`）：`+` 匹配单层（含空层），`#` 只在末尾、匹配零层或多层，
+空层是有效层（`a//b`、`a/`）；以通配符开头的过滤器（如 `#`、`+/x`）不匹配
+`$` 开头的系统主题，显式过滤器（`$SYS/#`）可以。数据库从未以 `--retained`
+运行过（无 retained 表）时查询返回空列表。

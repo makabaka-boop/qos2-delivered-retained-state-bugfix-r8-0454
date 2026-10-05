@@ -2,8 +2,10 @@
 
 关键事务边界：
 - ``save_pending``：PUBREC 发出之前，把待交付消息持久化（崩溃后重连仍在）；
+  RETAIN 标志作为首次受理内容的一部分一并落盘，重复 PUBLISH 不覆盖它；
 - ``finish_on_pubrel``：业务收件账写入 + 交换状态翻为 done，必须在同一个
-  SQLite 事务内提交，提交之后才允许发 PUBCOMP；
+  SQLite 事务内提交，提交之后才允许发 PUBCOMP；保留账（``--retained`` 启用时）
+  通过 ``_on_delivery`` 钩子在同一事务内更新；
 - 所有写事务都带 epoch 条件，被同名新连接接管的旧连接（旧 epoch）无法改账。
 
 ``qos2_flows.state``：
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS qos2_flows (
     state      TEXT NOT NULL CHECK (state IN ('pending', 'done')),
     topic      TEXT NOT NULL,
     payload    BLOB NOT NULL,
+    retain     INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL,
     PRIMARY KEY (client_id, packet_id)
 );
@@ -123,9 +126,18 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _migrate(self) -> None:
+        """为早期数据库补齐后加列（保留标志随首次受理内容一起持久化）。"""
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(qos2_flows)")}
+        if "retain" not in columns:
+            self.conn.execute(
+                "ALTER TABLE qos2_flows ADD COLUMN retain INTEGER NOT NULL DEFAULT 0"
+            )
 
     # -- 启动恢复 -----------------------------------------------------------
 
@@ -226,8 +238,13 @@ class Storage:
         topic: str,
         payload: bytes,
         dup: bool,
+        retain: bool = False,
     ) -> str:
         """PUBREC 前持久化 PUBLISH。
+
+        ``retain`` 是首次受理内容的一部分，与 topic/载荷一起落盘；重复 PUBLISH
+        （pending 重传或 done 后的 DUP=1 重发）不覆盖它，因此后续交付使用的
+        保留标志永远是首次受理时的那个。
 
         返回动作：
           'stored'  新消息或 PacketId 复用（DUP=0 顶替旧墓碑），已落盘；
@@ -246,18 +263,18 @@ class Storage:
 
             if flow is not None and (flow[0] == "pending" or dup):
                 # 重传 PUBLISH（4.3.3 DUP 重发）或对已完成交换的 DUP=1 重发：
-                # 保留原内容，幂等；调用方仍重发 PUBREC。
+                # 保留原内容（含 retain 标志），幂等；调用方仍重发 PUBREC。
                 tx.commit()
                 return "repeat"
 
             _crash_if("before_pending_commit")
             self.conn.execute(
                 "INSERT INTO qos2_flows(client_id, packet_id, state, topic, "
-                "payload, updated_at) VALUES(?,?, 'pending', ?, ?, ?) "
+                "payload, retain, updated_at) VALUES(?,?, 'pending', ?, ?, ?, ?) "
                 "ON CONFLICT(client_id, packet_id) DO UPDATE SET "
                 "state='pending', topic=excluded.topic, payload=excluded.payload, "
-                "updated_at=excluded.updated_at",
-                (client_id, packet_id, topic, sqlite3.Binary(payload), now),
+                "retain=excluded.retain, updated_at=excluded.updated_at",
+                (client_id, packet_id, topic, sqlite3.Binary(payload), int(retain), now),
             )
             tx.commit()
         _crash_if("after_pending_commit")
@@ -276,7 +293,7 @@ class Storage:
             self._check_epoch(self.conn, client_id, epoch, tx)
 
             flow = self.conn.execute(
-                "SELECT state, topic, payload FROM qos2_flows "
+                "SELECT state, topic, payload, retain FROM qos2_flows "
                 "WHERE client_id=? AND packet_id=?",
                 (client_id, packet_id),
             ).fetchone()
@@ -288,11 +305,15 @@ class Storage:
 
             _crash_if("before_pubrel_commit")
             # —— 同一事务：业务账写入与交换状态结束 ——
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO inbox(client_id, topic, payload, packet_id, "
                 "delivered_at) VALUES(?,?,?,?,?)",
                 (client_id, flow["topic"], flow["payload"], packet_id, now),
             )
+            inbox_id = cur.lastrowid
+            # 保留账（若启用）与业务账、交换状态在同一事务内变动，
+            # 因此三个账在持久边界上永远一致。
+            self._on_delivery(flow["topic"], flow["payload"], bool(flow["retain"]), inbox_id)
             self.conn.execute(
                 "UPDATE qos2_flows SET state='done', updated_at=? "
                 "WHERE client_id=? AND packet_id=?",
@@ -301,6 +322,14 @@ class Storage:
             tx.commit()
         _crash_if("after_pubrel_commit")
         return "delivered"
+
+    def _on_delivery(
+        self, topic: str, payload: bytes, retain: bool, inbox_id: int
+    ) -> None:
+        """交付成功的副作用钩子；基类无保留账，故为空操作。
+
+        仅在 ``finish_on_pubrel`` 的写事务内调用，子类据此原子更新保留账。
+        """
 
     # -- 只读查询 -----------------------------------------------------------
 
