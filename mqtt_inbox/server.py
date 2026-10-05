@@ -1,10 +1,11 @@
 """TCP 入口：手工驱动的 MQTT 3.1.1 入站接收状态机。
 
-支持的控制报文：CONNECT、QoS 2 PUBLISH、PUBREL、PINGREQ、DISCONNECT；
-服务端发送：CONNACK、PUBREC、PUBCOMP、PINGRESP。
+支持的控制报文：CONNECT、QoS 2 PUBLISH（含可选保留状态）、PUBREL、
+PINGREQ、DISCONNECT；服务端发送：CONNACK、PUBREC、PUBCOMP、PINGRESP。
 
 不支持（收到即按非法报文关闭连接或在 CONNECT 阶段拒绝）：
-遗嘱、Retained 消息、QoS 0/1、订阅、PUBACK/PUBREC 等客户端不该发的报文。
+遗嘱、QoS 0/1、订阅、PUBACK/PUBREC 等客户端不该发的报文。
+未启用 --retained 时，RETAIN 标志为 1 的 PUBLISH 同样按非法报文拒绝。
 """
 
 from __future__ import annotations
@@ -233,7 +234,8 @@ class ClientHandler:
         # parse_publish 已保证 qos>0 时 packet_id 非 0。
 
         # PUBREC 之前必须先完成持久化（含崩溃注入点）。
-        kwargs = {"retain": pub.retain} if self.retained else {}
+        # RETAIN 标志随首次受理内容一起落盘；是否据此维护保留账由存储实现
+        # 决定（普通 Storage 忽略，RetainedStorage 在 PUBREL 交付事务内处理）。
         storage.save_pending(
             self.client_id,
             self.epoch,
@@ -241,7 +243,7 @@ class ClientHandler:
             pub.topic,
             pub.payload,
             pub.dup,
-            **kwargs,
+            pub.retain,
         )
         self.send_all(framing.encode_pubrec(pub.packet_id))
 

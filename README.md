@@ -15,7 +15,8 @@
 | PUBREL / PUBCOMP | ✅ PUBREL | ✅ PUBCOMP |
 | PINGREQ / PINGRESP | ✅ | ✅（1.5×Keep Alive 超时关连接） |
 | DISCONNECT | ✅ | — |
-| SUBSCRIBE / 遗嘱 / Retain / QoS0,1 | ❌ 拒绝/关连接 | — |
+| SUBSCRIBE / 遗嘱 / QoS0,1 | ❌ 拒绝/关连接 | — |
+| RETAIN PUBLISH | ✅ 仅 `--retained` 启用时（见下）；未启用收到即关连接 | — |
 
 TCP 帧处理：
 - Remaining Length 1–4 字节变长解码，**跨 recv 边界**读取；
@@ -45,25 +46,30 @@ python3 -m mqtt_inbox.query --db inbox.db --json          # JSON
 ## 数据模型（SQLite，WAL + synchronous=FULL）
 
 - `sessions(client_id PK, clean, epoch, connected)`：协议会话。
-- `qos2_flows(client_id, packet_id, state, topic, payload, updated_at)`：
+- `qos2_flows(client_id, packet_id, state, topic, payload, retain, updated_at)`：
   QoS 2 交换状态，主键 `(client_id, packet_id)`。
-  - `pending`：PUBLISH 已在 **PUBREC 之前**持久化，等待 PUBREL；
+  - `pending`：PUBLISH 已在 **PUBREC 之前**持久化（含首次受理的 RETAIN 标志），
+    等待 PUBREL；
   - `done`：交换完成的**墓碑**，用于重复 PUBREL / DUP=1 重传去重。
 - `inbox(id, client_id, topic, payload, packet_id, delivered_at)`：业务收件账，
   只增不删（CleanSession 不影响它）。
+- `retained(topic PK, payload, inbox_id)`（仅 `--retained`，见下）：按主题的
+  保留账，与 ClientId 协议会话生命周期分离；`inbox_id` 指向产生当前值的
+  inbox 行。
 
 ## Exactly-once 与崩溃安全
 
 关键时序（均在提交事务之后才允许发送响应）：
 
 ```
-PUBLISH ──► [事务: upsert qos2_flows pending + 载荷] ──COMMIT──► PUBREC
-PUBREL  ──► [事务: INSERT inbox + UPDATE qos2_flows SET done] ──COMMIT──► PUBCOMP
+PUBLISH ──► [事务: upsert qos2_flows pending + 载荷 + RETAIN 标志] ──COMMIT──► PUBREC
+PUBREL  ──► [事务: INSERT inbox + 更新保留账 + UPDATE qos2_flows SET done] ──COMMIT──► PUBCOMP
 ```
 
 - **PUBREC 之前**待交付消息已落盘：崩溃/断线/重启后交换仍在；
-- PUBREL 的 **业务账写入与交换状态结束在同一个 SQLite 事务**，不会出现
-  “入了账但状态没结束（重启后重复入账）”或反过来的中间态；
+- PUBREL 的 **业务账写入、保留账更新与交换状态结束在同一个 SQLite 事务**，
+  不会出现“入了账但保留账没更新/状态没结束（重启后重复执行）”或反过来的
+  中间态；
 - 重复 PUBLISH（pending 中重传 / done 后 DUP=1 重发）不覆盖载荷、不重复入账，
   仍重发 PUBREC；
 - 重复/重放 PUBREL 不重复入账，仍重发 PUBCOMP（MQTT 3.1.1 §4.2.2/§4.3.3）；
@@ -103,19 +109,48 @@ python3 -m unittest discover -s tests -v
 - 同名接管后旧连接不能改账；CleanSession=1 清除旧协议会话；
 - Keepalive 1.5 倍超时断连、PING 保活；只读查询。
 
+## 本地保留状态（`--retained`）
+
+`--retained` 开启本地保留状态功能（仍无订阅和转发）。保留状态**只在
+QoS 2 交换成功交付的持久边界上可见**——即 PUBREL 处理事务提交之后：
+
+- 仅已完成 QoS2 交付的 **RETAIN=1** 消息更新按 topic 的保留账；
+- RETAIN 消息载荷为零长度 -> **删除**该 topic 的保留值；
+- 普通消息（RETAIN=0）不更新保留账，即使 topic 已存在保留值；
+- 重复 PUBLISH（pending 重传 / done 后 DUP=1 重发）保留**首次受理**的
+  topic、载荷及 RETAIN 标志；重传携带不同主题/载荷/标志一律忽略；
+- 重复 PUBREL 不重复交付、不改变保留值；完成后同一 PacketId 可复用，
+  新消息正常更新保留账；
+- 业务账、保留账、交换完成状态在**同一事务**内提交，崩溃注入的四个
+  时点上重启重放三者恒一致；
+- 保留账与 ClientId 协议会话生命周期分离：同名接管、CleanSession=1 清除
+  协议会话与交换状态、服务重启（含不以 `--retained` 启动）都不删除
+  已有保留账。
+
+等待 PUBREL/PUBCOMP 确认期间查询保留账，既看不到新值，也不会提前删除旧值。
+
+```bash
+python3 -m mqtt_inbox.retained_query --db PATH --filter FILTER
+```
+
+只读查询（SQLite `mode=ro`，保留表不存在时返回空）。过滤器遵循 MQTT
+3.1.1 §4.7：`+` 恰好匹配一个层（**空层是有效层**，`a//c` 匹配 `a/+/c`），
+`#` 只能位于末尾并匹配**零个或多个**层（`a/#` 匹配 `a`、`a/`、`a/b/c`）；
+首层为通配符（`+`/`#`）的过滤器**不匹配 `$` 开头的系统主题**，显式以 `$`
+开头的过滤器（如 `$SYS/#`）照常匹配。
+
 ## 代码结构
 
 ```
 mqtt_inbox/
-  framing.py   # MQTT 3.1.1 帧读写/编解码（手工状态机，零依赖）
-  storage.py   # SQLite 会话/交换状态/收件账，事务边界与 epoch 守卫
-  server.py    # TCP 入口、每连接线程、会话注册表、主分发循环
-  query.py     # 只读收件查询 CLI（mode=ro）
+  framing.py        # MQTT 3.1.1 帧读写/编解码（手工状态机，零依赖）
+  storage.py        # SQLite 会话/交换状态/收件账，事务边界与 epoch 守卫
+  retained.py       # 可选保留账（交付事务内更新）+ 主题过滤器/只读查询
+  server.py         # TCP 入口、每连接线程、会话注册表、主分发循环
+  query.py          # 只读收件查询 CLI（mode=ro）
+  retained_query.py # 只读保留状态查询 CLI（mode=ro + --filter）
 tests/
-  _peer.py     # 手工 MQTT 对端（任意拆包/粘连/非法字节）
-  _server.py   # 子进程服务器管理（含崩溃注入重启）
-  test_framing.py / test_storage.py / test_tcp.py
+  _peer.py          # 手工 MQTT 对端（任意拆包/粘连/非法字节）
+  _server.py        # 子进程服务器管理（含崩溃注入重启、--retained）
+  test_framing.py / test_storage.py / test_tcp.py / test_retained.py
 ```
-
-
---retained 开启本地保留状态功能（仍无订阅和转发）。仅已完成 QoS2 交付的 RETAIN 消息更新按 topic 的保留账；零长度载荷删除该 topic，普通消息不更新保留账。重复 PUBLISH 必须保留首次受理的 topic、载荷及 RETAIN；重复 PUBREL 不重复交付或改变保留值。业务账、保留账、交换完成状态必须持久一致。保留账与 ClientId 协议会话生命周期分离。python -m mqtt_inbox.retained_query --db PATH --filter FILTER 只读查询，+ 匹配单层、# 匹配末尾零层或多层，开头通配符不匹配 $ 系统主题；空层是有效层。

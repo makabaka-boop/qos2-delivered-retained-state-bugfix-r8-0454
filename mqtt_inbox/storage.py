@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS qos2_flows (
     state      TEXT NOT NULL CHECK (state IN ('pending', 'done')),
     topic      TEXT NOT NULL,
     payload    BLOB NOT NULL,
+    retain     INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL,
     PRIMARY KEY (client_id, packet_id)
 );
@@ -123,6 +124,17 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """旧库升级：retain 列在保留状态功能引入前不存在。"""
+        columns = {
+            r[1] for r in self.conn.execute("PRAGMA table_info(qos2_flows)")
+        }
+        if "retain" not in columns:
+            self.conn.execute(
+                "ALTER TABLE qos2_flows ADD COLUMN retain INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -226,13 +238,17 @@ class Storage:
         topic: str,
         payload: bytes,
         dup: bool,
+        retain: bool = False,
     ) -> str:
         """PUBREC 前持久化 PUBLISH。
 
         返回动作：
           'stored'  新消息或 PacketId 复用（DUP=0 顶替旧墓碑），已落盘；
           'repeat'  重复 PUBLISH（pending 重传，或对已完成交换的 DUP=1 重发），
-                    不覆盖已存内容，仍应重发 PUBREC。
+                    不覆盖已存内容（topic/payload/retain 均以首次受理为准），
+                    仍应重发 PUBREC。
+        本阶段**绝不触碰保留账**：保留状态只在交换成功交付（PUBREL 入账）后
+        才更新，等待确认期间查询不会提前看到新值或删除。
         epoch 不符 -> SessionTakenOver，旧连接无法改账。
         """
         now = time.time()
@@ -246,53 +262,81 @@ class Storage:
 
             if flow is not None and (flow[0] == "pending" or dup):
                 # 重传 PUBLISH（4.3.3 DUP 重发）或对已完成交换的 DUP=1 重发：
-                # 保留原内容，幂等；调用方仍重发 PUBREC。
+                # 保留原内容（含 RETAIN 标志），幂等；调用方仍重发 PUBREC。
                 tx.commit()
                 return "repeat"
 
             _crash_if("before_pending_commit")
             self.conn.execute(
                 "INSERT INTO qos2_flows(client_id, packet_id, state, topic, "
-                "payload, updated_at) VALUES(?,?, 'pending', ?, ?, ?) "
+                "payload, retain, updated_at) VALUES(?,?,'pending',?,?,?,?) "
                 "ON CONFLICT(client_id, packet_id) DO UPDATE SET "
                 "state='pending', topic=excluded.topic, payload=excluded.payload, "
-                "updated_at=excluded.updated_at",
-                (client_id, packet_id, topic, sqlite3.Binary(payload), now),
+                "retain=excluded.retain, updated_at=excluded.updated_at",
+                (
+                    client_id,
+                    packet_id,
+                    topic,
+                    sqlite3.Binary(payload),
+                    1 if retain else 0,
+                    now,
+                ),
             )
             tx.commit()
         _crash_if("after_pending_commit")
         return "stored"
 
+    @staticmethod
+    def _apply_retained_effect(conn, topic: str, payload: bytes, inbox_id: int) -> None:
+        """成功交付后对保留账的影响；默认（未启用 --retained）为空操作。
+
+        由 :class:`mqtt_inbox.retained.RetainedStorage` 在**同一入账事务内**
+        覆盖：仅 RETAIN 消息参与，零载荷删除，非零载荷 upsert。
+        """
+        return None
+
     def finish_on_pubrel(self, client_id: str, epoch: int, packet_id: int) -> str:
-        """收到 PUBREL：业务账写入 + 交换结束，必须同一事务，提交后才 PUBCOMP。
+        """收到 PUBREL：业务账写入 + 保留账更新 + 交换结束，必须同一事务，
+        提交后才 PUBCOMP。
+
+        保留状态**只由此处的首次成功交付决定**：
+          - RETAIN 非零载荷 -> 按 topic upsert 保留值；
+          - RETAIN 零载荷   -> 删除该 topic 的保留值；
+          - 普通消息        -> 不触碰保留账。
+        三者（inbox / retained / qos2_flows=done）在同一个持久边界上可见，
+        崩溃后不会出现“账已入而保留账未变”或反之。
 
         返回：
           'delivered' 首次处理 PUBREL，inbox 新增一条；
-          'repeat'    PUBREL 重放（done 墓碑或本连接无该交换）：不重复入账，
-                      调用方仍按 4.2.2 重发 PUBCOMP。
+          'repeat'    PUBREL 重放（done 墓碑或本连接无该交换）：不重复入账、
+                      不改变保留账，调用方仍按 4.2.2 重发 PUBCOMP。
         """
         now = time.time()
         with self._tx() as tx:
             self._check_epoch(self.conn, client_id, epoch, tx)
 
             flow = self.conn.execute(
-                "SELECT state, topic, payload FROM qos2_flows "
+                "SELECT state, topic, payload, retain FROM qos2_flows "
                 "WHERE client_id=? AND packet_id=?",
                 (client_id, packet_id),
             ).fetchone()
 
             if flow is None or flow["state"] == "done":
-                # 4.2.2：响应 PUBCOMP；已完成的消息不重复交付。
+                # 4.2.2：响应 PUBCOMP；已完成的消息不重复交付、不改变保留值。
                 tx.commit()
                 return "repeat"
 
             _crash_if("before_pubrel_commit")
-            # —— 同一事务：业务账写入与交换状态结束 ——
-            self.conn.execute(
+            # —— 同一事务：业务账写入、保留账更新、交换状态结束 ——
+            cur = self.conn.execute(
                 "INSERT INTO inbox(client_id, topic, payload, packet_id, "
                 "delivered_at) VALUES(?,?,?,?,?)",
                 (client_id, flow["topic"], flow["payload"], packet_id, now),
             )
+            if flow["retain"]:
+                self._apply_retained_effect(
+                    self.conn, flow["topic"], bytes(flow["payload"]), cur.lastrowid
+                )
             self.conn.execute(
                 "UPDATE qos2_flows SET state='done', updated_at=? "
                 "WHERE client_id=? AND packet_id=?",
